@@ -1,4 +1,7 @@
 #[allow(unused_imports)]
+use ansi_to_tui::IntoText;
+
+#[allow(unused_imports)]
 use std::io::{self, stdout, Write};
 
 #[allow(unused_imports)]
@@ -18,9 +21,14 @@ use ratatui::{
         Color, Modifier, Style, Stylize,
     },
     text::Line,
-    widgets::{Block, BorderType, Borders, List, ListState, Paragraph, StatefulWidget},
+    widgets::{Block, BorderType, Borders, List, ListState, Paragraph, StatefulWidget, Wrap},
     Frame, Terminal,
 };
+
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SynStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 pub enum CopyDirType {
     Parent,
@@ -46,8 +54,11 @@ pub struct DirList {
     pub state: ListState,
 }
 
+#[derive(Default, Clone)]
 pub struct File {
     pub path: String,
+    pub content: String,
+    pub name: String,
 }
 
 #[derive(Default)]
@@ -67,14 +78,17 @@ impl App {
         let curr_dir = std::env::current_dir().expect("Failed to get current directory");
         let parent_dir = curr_dir.parent();
         let curr_dir: String = curr_dir.to_string_lossy().to_string();
+
         match parent_dir {
-            None => {}
             Some(parent_dir) => {
-                let parent_dir: String = parent_dir.to_string_lossy().to_string();
-                self.parent_dir = Some(self.read_dir(&parent_dir));
+                let parent_dir = parent_dir.to_string_lossy().to_string();
+                self.update_parent_dir(CopyDirType::Path(parent_dir));
+            }
+            None => {
+                self.update_parent_dir(CopyDirType::Nothing);
             }
         }
-        self.curr_dir = self.read_dir(&curr_dir);
+        self.update_curr_dir(CopyDirType::Path(curr_dir));
 
         self.update_child_dir();
 
@@ -180,10 +194,12 @@ impl App {
         match copy {
             CopyDirType::Path(path) => {
                 self.curr_dir = self.read_dir(&path);
+                self.curr_dir.state.select(Some(0));
             }
             CopyDirType::Parent => {
                 if let Some(parent_dir) = &self.parent_dir {
                     self.curr_dir = parent_dir.clone();
+                    self.curr_dir.state.select(Some(0));
                 }
             }
 
@@ -193,6 +209,7 @@ impl App {
             CopyDirType::Child => {
                 if let Some(child_dir) = &self.child_dir {
                     self.curr_dir = child_dir.clone();
+                    self.curr_dir.state.select(Some(0));
                 }
             }
             _ => {}
@@ -233,10 +250,27 @@ impl App {
                     self.child_dir = Some(self.read_dir(&dir));
                     self.child_file = None;
                 } else {
-                    self.child_file = Some(File {
-                        path: format!("{}/{}", self.curr_dir.path, selected_entry.name),
-                    });
-                    self.child_dir = None;
+                    // Display child content
+
+                    let file_content = std::fs::read_to_string(format!(
+                        "{}/{}",
+                        self.curr_dir.path, selected_entry.name
+                    ));
+
+                    match file_content {
+                        Ok(file_content) => {
+                            self.child_file = Some(File {
+                                path: format!("{}/{}", self.curr_dir.path, selected_entry.name),
+                                name: selected_entry.name.clone(),
+                                content: file_content,
+                            });
+                            self.child_dir = None;
+                        }
+                        Err(_) => {
+                            self.child_file = Some(File::default());
+                            self.child_dir = None;
+                        }
+                    }
                 }
             }
         }
@@ -338,20 +372,50 @@ impl App {
                 format!("{}{}", entry.name, suffix)
             });
             let block = Block::new()
-                .title(Line::raw("child dir List").centered())
+                .title(Line::raw(child_dir.path.clone()).centered())
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded);
             let child_dir_entry_list = List::new(entry_list).block(block);
 
             f.render_stateful_widget(child_dir_entry_list, area, &mut ListState::default());
         } else if let Some(child_file) = &self.child_file {
-            let par = Paragraph::new(child_file.path.clone()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            );
+            let content = self.highlight_code(child_file.path.clone(), child_file.content.clone());
+            let par = Paragraph::new(content.clone())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Line::raw(child_file.name.clone()).centered()),
+                );
             f.render_widget(par, area);
         }
+    }
+
+    fn highlight_code(&self, path: String, content: String) -> Vec<ratatui::text::Line> {
+        let extension = path.split('.').last().unwrap_or("txt");
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+
+        // Find syntax from extension
+        let syntax = syntax_set
+            .find_syntax_by_extension(extension)
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+        let theme = &theme_set.themes["base16-mocha.dark"];
+
+        let mut highlighter = HighlightLines::new(syntax, theme);
+
+        let mut highlighted_content = String::new();
+
+        for line in LinesWithEndings::from(&content.to_string()) {
+            let ranges: Vec<(SynStyle, &str)> =
+                highlighter.highlight_line(line, &syntax_set).unwrap();
+            let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+            highlighted_content.push_str(&escaped);
+        }
+
+        let ansi_parsed = highlighted_content.clone().into_text().unwrap();
+        ansi_parsed.lines
     }
 }
 
